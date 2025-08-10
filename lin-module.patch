@@ -1,0 +1,338 @@
+From d306043ffe168e2cf18a486eb5aca101a1ba8c67 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 10 Aug 2025 09:55:31 +0000
+Subject: [PATCH] extmod: Add portable lin module; enable on stm32; wire to
+ build.\n\n- New extmod/modlin.c with LIN PID/checksum, header, request
+ APIs\n- Build guarded by MICROPY_PY_LIN, enabled in STM32 port\n- Uses
+ machine.UART stream and sendbreak()
+
+---
+ extmod/extmod.mk           |   6 +
+ extmod/modlin.c            | 286 +++++++++++++++++++++++++++++++++++++
+ ports/stm32/mpconfigport.h |   5 +
+ 3 files changed, 297 insertions(+)
+ create mode 100644 extmod/modlin.c
+
+diff --git a/extmod/extmod.mk b/extmod/extmod.mk
+index 37151ad..f388323 100644
+--- a/extmod/extmod.mk
++++ b/extmod/extmod.mk
+@@ -623,3 +623,9 @@ $(addprefix $(BUILD)/, $(SRC_OPENAMP_C:.c=.o)): $(BUILD)/openamp/metal/config.h
+ SRC_THIRDPARTY_C += $(SRC_OPENAMP_C) $(SRC_LIBMETAL_C:$(BUILD)/%=%)
+ 
+ endif # MICROPY_PY_OPENAMP
++
++# Optional LIN module
++ifeq ($(MICROPY_PY_LIN),1)
++CFLAGS_EXTMOD += -DMICROPY_PY_LIN=1
++SRC_EXTMOD_C += extmod/modlin.c
++endif
+diff --git a/extmod/modlin.c b/extmod/modlin.c
+new file mode 100644
+index 0000000..f8cbf16
+--- /dev/null
++++ b/extmod/modlin.c
+@@ -0,0 +1,286 @@
++#include "py/runtime.h"
++#include "py/stream.h"
++#include "py/builtin.h"
++
++// Portable LIN module built atop machine.UART stream API.
++// Requires a UART object passed in; optionally uses UART.sendbreak().
++
++#if MICROPY_PY_LIN
++
++// Object holding configuration/state for a LIN controller bound to a UART.
++typedef struct _mp_lin_obj_t {
++    mp_obj_base_t base;
++    mp_obj_t uart_obj;            // a machine.UART instance
++    bool enhanced_checksum;       // true for LIN2.x enhanced checksum (includes PID)
++    mp_uint_t timeout_us;         // per read/write wait (us)
++} mp_lin_obj_t;
++
++// Utility: Compute LIN PID from 6-bit identifier.
++static inline uint8_t lin_compute_pid(uint8_t id6) {
++    id6 &= 0x3F; // 6-bit
++    // Parity bits as per LIN spec: p0 = ID0^ID1^ID2^ID4; p1 = ~(ID1^ID3^ID4^ID5)
++    uint8_t p0 = ((id6 >> 0) ^ (id6 >> 1) ^ (id6 >> 2) ^ (id6 >> 4)) & 0x01;
++    uint8_t p1 = (~((id6 >> 1) ^ (id6 >> 3) ^ (id6 >> 4) ^ (id6 >> 5))) & 0x01;
++    return (uint8_t)(id6 | (p0 << 6) | (p1 << 7));
++}
++
++// Utility: Compute LIN checksum (classic or enhanced).
++static uint8_t lin_compute_checksum(const uint8_t *data, size_t len, bool enhanced, uint8_t pid) {
++    uint16_t sum = 0;
++    if (enhanced) {
++        sum += pid; // include protected identifier byte
++    }
++    for (size_t i = 0; i < len; ++i) {
++        sum += data[i];
++        // fold carries
++        sum = (sum & 0xFF) + (sum >> 8);
++    }
++    // finalize once more in case of new carry
++    sum = (sum & 0xFF) + (sum >> 8);
++    return (uint8_t)(~sum);
++}
++
++// Stream helpers
++static inline const mp_stream_p_t *lin_get_stream(mp_obj_t uart_obj) {
++    const mp_stream_p_t *stream_p = mp_get_stream_raise(uart_obj, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
++    return stream_p;
++}
++
++static void lin_stream_write_exact(mp_obj_t uart_obj, const uint8_t *buf, size_t len, mp_uint_t timeout_us) {
++    const mp_stream_p_t *stream_p = lin_get_stream(uart_obj);
++    mp_uint_t out_sz = 0;
++    int err = 0;
++    mp_uint_t flags = 0; // unused
++    (void)flags;
++    // Write all bytes (blocking with timeout per port policy)
++    out_sz = stream_p->write(uart_obj, buf, len, &err);
++    if (err != 0 || out_sz != len) {
++        if (err == 0) {
++            err = MP_EIO;
++        }
++        mp_raise_OSError(err);
++    }
++}
++
++static void lin_stream_read_exact(mp_obj_t uart_obj, uint8_t *buf, size_t len, mp_uint_t timeout_us) {
++    const mp_stream_p_t *stream_p = lin_get_stream(uart_obj);
++    int err = 0;
++    size_t got = 0;
++    while (got < len) {
++        mp_uint_t r = stream_p->read(uart_obj, buf + got, len - got, &err);
++        if (err != 0) {
++            mp_raise_OSError(err);
++        }
++        if (r == 0) {
++            // Treat as timeout
++            mp_raise_OSError(MP_ETIMEDOUT);
++        }
++        got += r;
++    }
++}
++
++// Call UART.sendbreak() if available; else raise.
++static void lin_uart_sendbreak(mp_obj_t uart_obj) {
++    mp_obj_t dest[2];
++    if (mp_load_method_maybe(uart_obj, MP_QSTR_sendbreak, dest)) {
++        mp_call_method_n_kw(0, 0, dest);
++        return;
++    }
++    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("UART.sendbreak() not available on this port"));
++}
++
++// Constructor: LIN(uart, *, enhanced=True, timeout_us=20000)
++static mp_obj_t lin_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
++    enum { ARG_uart, ARG_enhanced, ARG_timeout_us };
++    static const mp_arg_t allowed_args[] = {
++        { MP_QSTR_uart, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
++        { MP_QSTR_enhanced, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
++        { MP_QSTR_timeout_us, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 20000} },
++    };
++
++    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
++    mp_arg_parse_all(n_args, all_args, NULL, n_kw, allowed_args, args);
++
++    mp_lin_obj_t *self = mp_obj_malloc(mp_lin_obj_t, type);
++    self->uart_obj = args[ARG_uart].u_obj;
++    self->enhanced_checksum = args[ARG_enhanced].u_bool;
++    self->timeout_us = args[ARG_timeout_us].u_int;
++
++    // Validate UART is a stream
++    (void)lin_get_stream(self->uart_obj);
++
++    return MP_OBJ_FROM_PTR(self);
++}
++
++// header(id): Send break, sync(0x55), and PID.
++static mp_obj_t lin_send_header(mp_obj_t self_in, mp_obj_t id_in) {
++    mp_lin_obj_t *self = MP_OBJ_TO_PTR(self_in);
++    uint8_t id6 = (uint8_t)mp_obj_get_int(id_in);
++    uint8_t pid = lin_compute_pid(id6);
++
++    lin_uart_sendbreak(self->uart_obj);
++
++    uint8_t sync_and_pid[2] = {0x55, pid};
++    lin_stream_write_exact(self->uart_obj, sync_and_pid, 2, self->timeout_us);
++
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_2(lin_send_header_obj, lin_send_header);
++
++// pid(id) -> int
++static mp_obj_t lin_pid(mp_obj_t id_in) {
++    uint8_t id6 = (uint8_t)mp_obj_get_int(id_in);
++    return MP_OBJ_NEW_SMALL_INT(lin_compute_pid(id6));
++}
++static MP_DEFINE_CONST_FUN_OBJ_1(lin_pid_obj, lin_pid);
++
++// checksum(data, *, enhanced=True, pid=None) -> int
++static mp_obj_t lin_checksum(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
++    enum { ARG_data, ARG_enhanced, ARG_pid };
++    static const mp_arg_t allowed_args[] = {
++        { MP_QSTR_data, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
++        { MP_QSTR_enhanced, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
++        { MP_QSTR_pid, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
++    };
++
++    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
++    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
++
++    mp_buffer_info_t bufinfo;
++    mp_get_buffer_raise(args[ARG_data].u_obj, &bufinfo, MP_BUFFER_READ);
++
++    bool enhanced = args[ARG_enhanced].u_bool;
++    int pid_val = args[ARG_pid].u_int;
++    uint8_t pid = (pid_val < 0) ? 0 : (uint8_t)pid_val;
++
++    if (enhanced && pid_val < 0) {
++        mp_raise_ValueError(MP_ERROR_TEXT("enhanced checksum requires pid"));
++    }
++
++    uint8_t cks = lin_compute_checksum((const uint8_t *)bufinfo.buf, bufinfo.len, enhanced, pid);
++    return MP_OBJ_NEW_SMALL_INT(cks);
++}
++static MP_DEFINE_CONST_FUN_OBJ_KW(lin_checksum_obj, 1, lin_checksum);
++
++// request(self, id, data=None, length=None) -> bytes or None
++// If data is provided, sends data (1..8) plus checksum. If length is provided, reads that many bytes and verifies checksum, returning data.
++static mp_obj_t lin_request(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
++    enum { ARG_self, ARG_id, ARG_data, ARG_length };
++    static const mp_arg_t allowed_args[] = {
++        { MP_QSTR_self, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
++        { MP_QSTR_id, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
++        { MP_QSTR_data, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
++        { MP_QSTR_length, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
++    };
++
++    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
++    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
++
++    mp_lin_obj_t *self = MP_OBJ_TO_PTR(args[ARG_self].u_obj);
++    uint8_t id6 = (uint8_t)args[ARG_id].u_int;
++    uint8_t pid = lin_compute_pid(id6);
++
++    bool has_data = args[ARG_data].u_obj != MP_OBJ_NULL && args[ARG_data].u_obj != mp_const_none;
++    bool has_len = args[ARG_length].u_int > 0;
++    if (has_data && has_len) {
++        mp_raise_ValueError(MP_ERROR_TEXT("specify either data or length, not both"));
++    }
++    if (!has_data && !has_len) {
++        mp_raise_ValueError(MP_ERROR_TEXT("must specify data to write or length to read"));
++    }
++
++    // Send header first
++    lin_uart_sendbreak(self->uart_obj);
++    uint8_t sync_and_pid[2] = {0x55, pid};
++    lin_stream_write_exact(self->uart_obj, sync_and_pid, 2, self->timeout_us);
++
++    if (has_data) {
++        // Write data then checksum
++        mp_buffer_info_t bufinfo;
++        mp_get_buffer_raise(args[ARG_data].u_obj, &bufinfo, MP_BUFFER_READ);
++        if (bufinfo.len < 1 || bufinfo.len > 8) {
++            mp_raise_ValueError(MP_ERROR_TEXT("data length must be 1..8"));
++        }
++        lin_stream_write_exact(self->uart_obj, (const uint8_t *)bufinfo.buf, bufinfo.len, self->timeout_us);
++        uint8_t cks = lin_compute_checksum((const uint8_t *)bufinfo.buf, bufinfo.len, self->enhanced_checksum, pid);
++        lin_stream_write_exact(self->uart_obj, &cks, 1, self->timeout_us);
++        return mp_const_none;
++    } else {
++        // Read response of given length and verify checksum
++        size_t len = (size_t)args[ARG_length].u_int;
++        if (len < 1 || len > 8) {
++            mp_raise_ValueError(MP_ERROR_TEXT("length must be 1..8"));
++        }
++        vstr_t v; vstr_init_len(&v, len);
++        lin_stream_read_exact(self->uart_obj, (uint8_t *)v.buf, len, self->timeout_us);
++        uint8_t rx_cksum = 0;
++        lin_stream_read_exact(self->uart_obj, &rx_cksum, 1, self->timeout_us);
++        uint8_t calc = lin_compute_checksum((const uint8_t *)v.buf, len, self->enhanced_checksum, pid);
++        if (rx_cksum != calc) {
++            vstr_clear(&v);
++            mp_raise_ValueError(MP_ERROR_TEXT("checksum mismatch"));
++        }
++        return mp_obj_new_bytes_from_vstr(&v);
++    }
++}
++static MP_DEFINE_CONST_FUN_OBJ_KW(lin_request_obj, 2, lin_request);
++
++// Properties setters
++static mp_obj_t lin_set_enhanced(mp_obj_t self_in, mp_obj_t val_in) {
++    mp_lin_obj_t *self = MP_OBJ_TO_PTR(self_in);
++    self->enhanced_checksum = mp_obj_is_true(val_in);
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_2(lin_set_enhanced_obj, lin_set_enhanced);
++
++static mp_obj_t lin_set_timeout_us(mp_obj_t self_in, mp_obj_t val_in) {
++    mp_lin_obj_t *self = MP_OBJ_TO_PTR(self_in);
++    self->timeout_us = mp_obj_get_int(val_in);
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_2(lin_set_timeout_us_obj, lin_set_timeout_us);
++
++// Print
++static void lin_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
++    mp_lin_obj_t *self = MP_OBJ_TO_PTR(self_in);
++    mp_printf(print, "LIN(uart=%p, enhanced=%d, timeout_us=%u)", self->uart_obj, (int)self->enhanced_checksum, (unsigned)self->timeout_us);
++}
++
++// Locals dict
++static const mp_rom_map_elem_t lin_locals_table[] = {
++    { MP_ROM_QSTR(MP_QSTR_header), MP_ROM_PTR(&lin_send_header_obj) },
++    { MP_ROM_QSTR(MP_QSTR_request), MP_ROM_PTR(&lin_request_obj) },
++
++    { MP_ROM_QSTR(MP_QSTR_set_enhanced), MP_ROM_PTR(&lin_set_enhanced_obj) },
++    { MP_ROM_QSTR(MP_QSTR_set_timeout_us), MP_ROM_PTR(&lin_set_timeout_us_obj) },
++
++    { MP_ROM_QSTR(MP_QSTR_pid), MP_ROM_PTR(&lin_pid_obj) },
++    { MP_ROM_QSTR(MP_QSTR_checksum), MP_ROM_PTR(&lin_checksum_obj) },
++};
++static MP_DEFINE_CONST_DICT(lin_locals_dict, lin_locals_table);
++
++// Type
++MP_DEFINE_CONST_OBJ_TYPE(
++    lin_type,
++    MP_QSTR_LIN,
++    MP_TYPE_FLAG_NONE,
++    make_new, lin_make_new,
++    print, lin_print,
++    locals_dict, &lin_locals_dict
++);
++
++// Module globals
++static const mp_rom_map_elem_t lin_module_globals_table[] = {
++    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_lin) },
++    { MP_ROM_QSTR(MP_QSTR_LIN), MP_ROM_PTR(&lin_type) },
++};
++static MP_DEFINE_CONST_DICT(lin_module_globals, lin_module_globals_table);
++
++const mp_obj_module_t mp_module_lin = {
++    .base = { &mp_type_module },
++    .globals = (mp_obj_dict_t *)&lin_module_globals,
++};
++
++MP_REGISTER_MODULE(MP_QSTR_lin, mp_module_lin);
++
++#endif // MICROPY_PY_LIN
+\ No newline at end of file
+diff --git a/ports/stm32/mpconfigport.h b/ports/stm32/mpconfigport.h
+index 191503c..4888dd5 100644
+--- a/ports/stm32/mpconfigport.h
++++ b/ports/stm32/mpconfigport.h
+@@ -306,3 +306,8 @@ typedef long mp_off_t;
+ 
+ // Needed for MICROPY_PY_RANDOM_SEED_INIT_FUNC.
+ uint32_t rng_get(void);
++
++// Enable LIN module for STM32 builds (can be overridden in board config)
++#ifndef MICROPY_PY_LIN
++#define MICROPY_PY_LIN (1)
++#endif
+-- 
+2.48.1
+
